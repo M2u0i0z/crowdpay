@@ -7,7 +7,11 @@ const SIGNING_ALGO = 'sha256';
 const SIGNED_URL_TTL_SECONDS = 24 * 60 * 60;
 
 function signingSecret() {
-  return process.env.JWT_SECRET || 'campaign-report-signing-secret';
+  const s = process.env.CAMPAIGN_REPORT_SIGNING_SECRET || process.env.JWT_SECRET;
+  if (!s) {
+    throw new Error('CAMPAIGN_REPORT_SIGNING_SECRET (or JWT_SECRET fallback) is not configured');
+  }
+  return s;
 }
 
 function verifySignedToken(token, campaignId) {
@@ -16,10 +20,7 @@ function verifySignedToken(token, campaignId) {
   const payload = token.slice(0, sep);
   const sig = token.slice(sep + 1);
 
-  const expected = crypto
-    .createHmac(SIGNING_ALGO, signingSecret())
-    .update(payload)
-    .digest('hex');
+  const expected = crypto.createHmac(SIGNING_ALGO, signingSecret()).update(payload).digest('hex');
 
   const supplied = Buffer.from(sig, 'hex');
   const expectedBuf = Buffer.from(expected, 'hex');
@@ -39,10 +40,7 @@ function generateSignedUrl(campaignId, baseUrl) {
     exp: Date.now() + SIGNED_URL_TTL_SECONDS * 1000,
   });
   const encoded = Buffer.from(payload).toString('base64url');
-  const sig = crypto
-    .createHmac(SIGNING_ALGO, signingSecret())
-    .update(encoded)
-    .digest('hex');
+  const sig = crypto.createHmac(SIGNING_ALGO, signingSecret()).update(encoded).digest('hex');
   return `${baseUrl}/api/campaigns/${campaignId}/report/share/${encoded}.${sig}`;
 }
 
@@ -142,7 +140,7 @@ async function assembleReport(campaignId) {
   const raised = Number(t.total_received) || 0;
   const goalPct = target > 0 ? Math.min(100, (raised / target) * 100) : 0;
 
-  const milestones = milestonesResult.rows.map((m) => {
+  const milestones = milestonesResult.rows.map(m => {
     const threshold = (Number(m.release_percentage) / 100) * target;
     const progressPct = target > 0 ? Math.min(100, (raised / threshold) * 100) : 0;
     return {
@@ -157,7 +155,7 @@ async function assembleReport(campaignId) {
     };
   });
 
-  const topContributors = topContributorsResult.rows.map((r) => ({
+  const topContributors = topContributorsResult.rows.map(r => ({
     display_name: r.display_name || r.contributor_name || 'Anonymous',
     truncated_key: truncPubKey(r.sender_public_key),
     contribution_count: r.contribution_count,
@@ -165,13 +163,13 @@ async function assembleReport(campaignId) {
     first_contribution_at: r.first_contribution_at,
   }));
 
-  const dailySeries = dailySeriesResult.rows.map((r) => ({
+  const dailySeries = dailySeriesResult.rows.map(r => ({
     day: r.day,
     count: r.count,
     amount: Number(r.amount),
   }));
 
-  const timeline = statusEventsResult.rows.map((e) => ({
+  const timeline = statusEventsResult.rows.map(e => ({
     from: e.old_status,
     to: e.new_status,
     at: e.created_at,
@@ -206,7 +204,7 @@ async function assembleReport(campaignId) {
     engagement: {
       total_contributions: t.total_contributions,
       unique_contributors: t.unique_contributors,
-      asset_breakdown: assetBreakdownResult.rows.map((a) => ({
+      asset_breakdown: assetBreakdownResult.rows.map(a => ({
         asset: a.asset,
         count: a.count,
         total: Number(a.total),

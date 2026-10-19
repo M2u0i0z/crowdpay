@@ -28,7 +28,12 @@ function dueSchedule(overrides = {}) {
   };
 }
 
-function buildService({ schedule = dueSchedule(), chargeImpl, queryImpl } = {}) {
+function buildService({
+  schedule = dueSchedule(),
+  chargeImpl,
+  queryImpl,
+  lockState = { locked: false },
+} = {}) {
   const calls = [];
   const emails = [];
   const db = {
@@ -41,15 +46,28 @@ function buildService({ schedule = dueSchedule(), chargeImpl, queryImpl } = {}) 
       if (text.includes('FROM recurring_contributions rc')) return { rows: [schedule] };
       return { rows: [] };
     },
+    connect: async () => ({
+      query: async text => {
+        if (text.includes('pg_try_advisory_lock')) {
+          const locked = !lockState.locked;
+          if (locked) lockState.locked = true;
+          return { rows: [{ locked }] };
+        }
+        if (text.includes('pg_advisory_unlock')) {
+          lockState.locked = false;
+          return { rows: [] };
+        }
+        return { rows: [] };
+      },
+      release: () => {},
+    }),
   };
 
   const service = proxyquire('./recurringContributionsService', {
     '../config/database': db,
     '../config/logger': silentLogger,
     './contributionService': {
-      submitCustodialContribution:
-        chargeImpl ||
-        (async () => ({ txHash: 'tx-success' })),
+      submitCustodialContribution: chargeImpl || (async () => ({ txHash: 'tx-success' })),
     },
     './emailService': {
       sendRecurringContributionNoticeEmail: async ({ kind }) => {
@@ -63,8 +81,10 @@ function buildService({ schedule = dueSchedule(), chargeImpl, queryImpl } = {}) 
 
 test('processRecurringContributions charges due schedules and advances them', async () => {
   let chargedWith = null;
+  const schedule = dueSchedule();
   const { service, calls, emails } = buildService({
-    chargeImpl: async (args) => {
+    schedule,
+    chargeImpl: async args => {
       chargedWith = args;
       return { txHash: 'tx-success' };
     },
@@ -76,14 +96,18 @@ test('processRecurringContributions charges due schedules and advances them', as
   assert.equal(chargedWith.campaignId, 'camp-1');
   assert.equal(chargedWith.walletPublicKey, 'GCONTRIBUTOR');
   assert.equal(chargedWith.campaign.wallet_public_key, 'GCAMPAIGN');
-  assert.equal(chargedWith.amount, 10);
+  assert.equal(chargedWith.amount, '10');
   assert.equal(chargedWith.sendAsset, 'XLM');
+  assert.equal(
+    chargedWith.idempotencyKey,
+    `recurring-contribution:${SCHEDULE_ID}:${new Date(schedule.next_run_at).toISOString()}`
+  );
 
   // upcoming + charged notifications were sent.
   assert.deepEqual(emails.sort(), ['charged', 'upcoming']);
 
   // Schedule advanced and failure state cleared.
-  const advance = calls.find((c) => c.text.includes('failure_count = 0'));
+  const advance = calls.find(c => c.text.includes('failure_count = 0'));
   assert.ok(advance, 'expected success UPDATE');
   assert.equal(advance.text.includes("'1 month'"), true);
   assert.equal(advance.params[0], SCHEDULE_ID);
@@ -99,7 +123,7 @@ test('processRecurringContributions records failure and applies exponential back
 
   await service.processRecurringContributions();
 
-  const backoff = calls.find((c) => c.text.includes('failure_count = $2'));
+  const backoff = calls.find(c => c.text.includes('failure_count = $2'));
   assert.ok(backoff, 'expected failure UPDATE');
   assert.equal(backoff.params[1], 3); // failure_count incremented
   assert.match(backoff.params[2], /horizon unavailable/);
@@ -119,7 +143,7 @@ test('backoffMinutes scales exponentially and is capped at 24 hours', () => {
 
 test('processRecurringContributions exits early with nothing due', async () => {
   const { service, calls } = buildService({
-    queryImpl: async (text) => {
+    queryImpl: async text => {
       if (text.includes('FROM recurring_contributions rc')) return { rows: [] };
       return { rows: [] };
     },
@@ -127,6 +151,35 @@ test('processRecurringContributions exits early with nothing due', async () => {
 
   await service.processRecurringContributions();
   // No charge / no update runs when there are no due schedules.
-  assert.ok(!calls.some((c) => c.text.includes('submitCustodialContribution')));
-  assert.ok(!calls.some((c) => c.text.includes('UPDATE recurring_contributions')));
+  assert.ok(!calls.some(c => c.text.includes('submitCustodialContribution')));
+  assert.ok(!calls.some(c => c.text.includes('UPDATE recurring_contributions')));
+});
+
+test('concurrent recurring contribution runs charge a due schedule only once', async () => {
+  const lockState = { locked: false };
+  let chargeStarted;
+  const chargeStartedPromise = new Promise(resolve => {
+    chargeStarted = resolve;
+  });
+  let finishCharge;
+  const chargeGate = new Promise(resolve => {
+    finishCharge = resolve;
+  });
+  let chargeCount = 0;
+  const { service } = buildService({
+    lockState,
+    chargeImpl: async () => {
+      chargeCount += 1;
+      chargeStarted();
+      await chargeGate;
+      return { txHash: 'tx-success' };
+    },
+  });
+
+  const firstRun = service.processRecurringContributions();
+  await chargeStartedPromise;
+  await service.processRecurringContributions();
+  assert.equal(chargeCount, 1);
+  finishCharge();
+  await firstRun;
 });

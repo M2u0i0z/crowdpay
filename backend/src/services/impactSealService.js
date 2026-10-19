@@ -39,10 +39,12 @@ function computeStats(contributions, currency) {
 }
 
 function signStats(stats, campaignId) {
+  const signingSecret = process.env.IMPACT_SIGNING_SECRET;
+  if (!signingSecret) {
+    throw new Error('IMPACT_SIGNING_SECRET is not configured');
+  }
   const payload = JSON.stringify({ campaign_id: campaignId, ...stats });
-  const signature = crypto.createHmac('sha256', process.env.IMPACT_SIGNING_SECRET || 'crowdpay-impact-secret')
-    .context(data)
-    .digest('hex');
+  const signature = crypto.createHmac('sha256', signingSecret).update(payload).digest('hex');
   return {
     ...stats,
     campaign_id: campaignId,

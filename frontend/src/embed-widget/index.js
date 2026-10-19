@@ -6,7 +6,8 @@ export function initCrowdPayEmbed(scriptTag) {
   if (!campaignId) return;
 
   const theme = script.getAttribute('data-theme') || 'light';
-  const size = script.getAttribute('data-size') || 'medium';
+  const rawSize = script.getAttribute('data-size') || 'medium';
+  const size = ['large', 'small', 'medium'].includes(rawSize) ? rawSize : 'medium';
 
   const origin = window.location.origin;
   const iframe = document.createElement('iframe');
@@ -14,7 +15,8 @@ export function initCrowdPayEmbed(scriptTag) {
   iframe.title = 'CrowdPay Campaign Widget';
   iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-popups allow-forms');
   iframe.setAttribute('allow', 'payment');
-  iframe.style.cssText = 'width:100%;border:0;display:block;overflow:hidden;background:transparent;';
+  iframe.style.cssText =
+    'width:100%;border:0;display:block;overflow:hidden;background:transparent;';
 
   if (size === 'large') {
     iframe.style.minHeight = '300px';

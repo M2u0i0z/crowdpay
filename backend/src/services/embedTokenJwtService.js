@@ -3,7 +3,11 @@
 const jwt = require('jsonwebtoken');
 
 function getJwtSecret() {
-  return process.env.JWT_SECRET || 'testsecret';
+  const s = process.env.JWT_SECRET;
+  if (!s) {
+    throw new Error('JWT_SECRET is not configured');
+  }
+  return s;
 }
 
 /**
@@ -56,7 +60,7 @@ function validateOrigin(originHeader, allowedOrigins = []) {
   if (allowedOrigins.includes('*')) return true;
 
   const normalizedOrigin = originHeader.trim().replace(/\/+$/, '').toLowerCase();
-  return allowedOrigins.some((allowed) => {
+  return allowedOrigins.some(allowed => {
     if (allowed === '*') return true;
     if (typeof allowed !== 'string') return false;
     const normalizedAllowed = allowed.trim().replace(/\/+$/, '').toLowerCase();

@@ -22,10 +22,9 @@ async function extractFeatures({ userId, amount, ipAddress, deviceFingerprint })
       );
       recentCount = parseInt(rows[0]?.cnt || '0', 10);
 
-      const { rows: userRows } = await db.query(
-        `SELECT created_at FROM users WHERE id = $1`,
-        [userId]
-      );
+      const { rows: userRows } = await db.query(`SELECT created_at FROM users WHERE id = $1`, [
+        userId,
+      ]);
       if (userRows[0]?.created_at) {
         const diffMs = Date.now() - new Date(userRows[0].created_at).getTime();
         walletAgeDays = Math.max(0, Math.floor(diffMs / (1000 * 60 * 60 * 24)));
@@ -52,7 +51,10 @@ async function extractFeatures({ userId, amount, ipAddress, deviceFingerprint })
   let ipScore = ipAddress && ipAddress.startsWith('192.0.2.') ? 50 : 0;
   let deviceScore = deviceFingerprint && deviceFingerprint.includes('suspicious') ? 40 : 0;
 
-  const score = Math.min(100, amountScore + frequencyScore + walletAgeScore + ipScore + deviceScore);
+  const score = Math.min(
+    100,
+    amountScore + frequencyScore + walletAgeScore + ipScore + deviceScore
+  );
 
   const breakdown = {
     amount: { score: amountScore, detail: `Amount: ${numAmount}` },
@@ -68,8 +70,20 @@ async function extractFeatures({ userId, amount, ipAddress, deviceFingerprint })
 /**
  * Score a contribution in real-time. Records the assessment and flags if high-risk.
  */
-async function scoreContribution({ contributionId, campaignId, userId, amount, ipAddress, deviceFingerprint }) {
-  const { score, breakdown, isHighRisk } = await extractFeatures({ userId, amount, ipAddress, deviceFingerprint });
+async function scoreContribution({
+  contributionId,
+  campaignId,
+  userId,
+  amount,
+  ipAddress,
+  deviceFingerprint,
+}) {
+  const { score, breakdown, isHighRisk } = await extractFeatures({
+    userId,
+    amount,
+    ipAddress,
+    deviceFingerprint,
+  });
 
   const status = isHighRisk ? 'held_for_review' : 'approved';
 
@@ -81,11 +95,19 @@ async function scoreContribution({ contributionId, campaignId, userId, amount, i
       [contributionId, campaignId, userId || null, score, JSON.stringify(breakdown), status]
     );
   } catch (err) {
-    logger.error('Failed to store contribution fraud score', { error: err.message, contributionId });
+    logger.error('Failed to store contribution fraud score', {
+      error: err.message,
+      contributionId,
+    });
   }
 
   if (isHighRisk) {
-    logger.warn('Contribution flagged for high fraud risk', { contributionId, campaignId, score, breakdown });
+    logger.warn('Contribution flagged for high fraud risk', {
+      contributionId,
+      campaignId,
+      score,
+      breakdown,
+    });
     // Optionally notify admins
   }
 
@@ -144,11 +166,98 @@ async function getFraudDashboard({ status, limit = 50, offset = 0 }) {
 }
 
 /**
- * Retrain model placeholder / statistics hook
+ * Retrain / re-validate the fraud model.
+ *
+ * There is no ML training pipeline in this codebase yet — "retrain" here
+ * means recomputing validation metrics from real admin review outcomes
+ * (contribution_fraud_scores rows an admin has resolved as 'approved' vs
+ * 'rejected' after being held for review) and persisting a new versioned
+ * snapshot, instead of returning hardcoded numbers (#808). If there isn't
+ * enough resolved data yet to compute a meaningful rate, that is reported
+ * explicitly rather than papered over with a fake metric.
  */
 async function retrainModel() {
-  logger.info('Fraud detection model retrained successfully with latest validation dataset.');
-  return { success: true, falsePositiveRate: '1.2%', validationSamples: 12500 };
+  const { rows: statsRows } = await db.query(
+    `SELECT
+       COUNT(*) FILTER (WHERE status IN ('approved', 'rejected'))::int AS resolved_count,
+       COUNT(*) FILTER (WHERE status = 'approved')::int AS false_positive_count
+     FROM contribution_fraud_scores`
+  );
+  const { resolved_count: resolvedCount, false_positive_count: falsePositiveCount } = statsRows[0];
+
+  const { rows: versionRows } = await db.query(
+    `SELECT COALESCE(MAX(version), 0) + 1 AS next_version FROM fraud_model_versions`
+  );
+  const nextVersion = versionRows[0].next_version;
+
+  if (resolvedCount === 0) {
+    const { rows } = await db.query(
+      `INSERT INTO fraud_model_versions (version, status, false_positive_rate, validation_samples, notes)
+       VALUES ($1, 'insufficient_data', NULL, 0, 'No resolved fraud reviews yet to compute a false positive rate')
+       RETURNING *`,
+      [nextVersion]
+    );
+    logger.warn('Fraud model retrain skipped scoring: no resolved review data yet', {
+      version: nextVersion,
+    });
+    return {
+      success: false,
+      version: rows[0].version,
+      status: rows[0].status,
+      message: rows[0].notes,
+      validationSamples: 0,
+    };
+  }
+
+  const falsePositiveRate = falsePositiveCount / resolvedCount;
+  const { rows } = await db.query(
+    `INSERT INTO fraud_model_versions (version, status, false_positive_rate, validation_samples)
+     VALUES ($1, 'completed', $2, $3)
+     RETURNING *`,
+    [nextVersion, falsePositiveRate, resolvedCount]
+  );
+
+  logger.info('Fraud detection model revalidated from real review outcomes', {
+    version: rows[0].version,
+    false_positive_rate: falsePositiveRate,
+    validation_samples: resolvedCount,
+  });
+
+  return {
+    success: true,
+    version: rows[0].version,
+    status: rows[0].status,
+    falsePositiveRate,
+    validationSamples: resolvedCount,
+  };
+}
+
+/**
+ * Evaluate fraud risk for all contributions on a campaign.
+ * Convenience wrapper around per-contribution scoring used by the ledger
+ * monitor after a contribution is indexed.
+ * @param {string} campaignId
+ */
+async function evaluateCampaign(campaignId) {
+  const { rows } = await db.query(
+    `SELECT id, user_id, amount, ip_address, device_fingerprint
+     FROM contributions WHERE campaign_id = $1 AND created_at > NOW() - INTERVAL '1 hour'`,
+    [campaignId]
+  );
+  const results = await Promise.all(
+    rows.map(row =>
+      scoreContribution({
+        contributionId: row.id,
+        campaignId,
+        userId: row.user_id,
+        amount: row.amount,
+        ipAddress: row.ip_address,
+        deviceFingerprint: row.device_fingerprint,
+      }).catch(err => ({ contributionId: row.id, error: err.message }))
+    )
+  );
+  const highRisk = results.filter(r => r.isHighRisk);
+  return { campaignId, assessed: results.length, highRisk: highRisk.length };
 }
 
 module.exports = {
@@ -157,4 +266,5 @@ module.exports = {
   resolveFlaggedContribution,
   getFraudDashboard,
   retrainModel,
+  evaluateCampaign,
 };
